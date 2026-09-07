@@ -18,6 +18,7 @@ python run_paper_batch.py --runs 2 --steps 5 --N 16 --out test_results --scenari
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 import json
 from typing import Dict, List
@@ -106,11 +107,24 @@ def correlation_table(all_runs: pd.DataFrame) -> pd.DataFrame:
         "S_tail_ablation_lattice",
         "S_bimodal_ablation_lattice",
         "S_full_lattice",
+        "tail_score_lattice",
+        "bimodal_score_lattice",
+        "weighted_tail_contribution_lattice",
+        "weighted_bimodal_contribution_lattice",
         "wN_lattice",
         "wT_lattice",
         "wB_lattice",
     ]
-    targets = ["polarization", "central_depletion", "tail_mass", "segregation"]
+    targets = [
+        "polarization",
+        "central_depletion",
+        "tail_mass",
+        "segregation",
+        "bimodality_coefficient",
+        "esteban_ray_polarization",
+        "morans_I",
+        "sign_assortativity",
+    ]
 
     rows: List[Dict[str, float | str | int]] = []
     for (scenario, run_idx), dfr in all_runs.groupby(["scenario", "run"]):
@@ -147,6 +161,37 @@ def correlation_table(all_runs: pd.DataFrame) -> pd.DataFrame:
     return summary
 
 
+def _run_one_job(payload):
+    """Run one independent simulation in a worker process."""
+    args_dict, scenario, run_idx = payload
+    args = argparse.Namespace(**args_dict)
+    params = make_params(args, scenario=int(scenario), run_idx=int(run_idx))
+    C_hist, M_hist, stats_df = run_simulation(params)
+    metrics_df = compute_metrics_for_history(
+        C_hist,
+        M_hist,
+        params=params,
+        stats_df=stats_df,
+        alpha_smooth=float(args.alpha_smooth),
+        q_tsallis=float(args.q_tsallis),
+        beta_tail=float(args.beta_tail),
+        beta_bimodal=float(args.beta_bimodal),
+        tail_threshold=args.tail_threshold,
+        center_threshold=args.center_threshold,
+        kappa_center=float(args.kappa_center),
+    )
+    metrics_df.insert(0, "scenario", int(scenario))
+    metrics_df.insert(1, "run", int(run_idx))
+    metrics_df["seed_positions"] = params.seed_positions
+    metrics_df["seed_affil"] = params.seed_affil
+    metrics_df["seed_money"] = params.seed_money
+    metrics_df["seed_dynamics"] = params.seed_dynamics
+    representative = None
+    if int(run_idx) == int(args.representative_run):
+        representative = (C_hist, M_hist, stats_df)
+    return int(scenario), int(run_idx), metrics_df, params.to_jsonable(), representative
+
+
 def run_pipeline(args: argparse.Namespace) -> None:
     out_root = Path(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -158,40 +203,29 @@ def run_pipeline(args: argparse.Namespace) -> None:
     all_rows: List[pd.DataFrame] = []
     params_records: List[Dict] = []
 
-    for scenario in args.scenarios:
-        scenario = int(scenario)
-        print(f"\n=== Scenario {scenario} ===")
-        for run_idx in range(int(args.runs)):
-            params = make_params(args, scenario=scenario, run_idx=run_idx)
-            print(f"Scenario {scenario}, run {run_idx + 1}/{args.runs}")
+    tasks = [
+        (vars(args), int(scenario), run_idx)
+        for scenario in args.scenarios
+        for run_idx in range(int(args.runs))
+    ]
+    if int(args.n_jobs) == 1:
+        results = map(_run_one_job, tasks)
+    else:
+        executor = ProcessPoolExecutor(max_workers=int(args.n_jobs))
+        results = executor.map(_run_one_job, tasks)
 
-            C_hist, M_hist, stats_df = run_simulation(params)
-            metrics_df = compute_metrics_for_history(
-                C_hist,
-                M_hist,
-                params=params,
-                stats_df=stats_df,
-                alpha_smooth=float(args.alpha_smooth),
-                q_tsallis=float(args.q_tsallis),
-                beta_tail=float(args.beta_tail),
-                beta_bimodal=float(args.beta_bimodal),
-                tail_threshold=args.tail_threshold,
-                center_threshold=args.center_threshold,
-                kappa_center=float(args.kappa_center),
-            )
-            metrics_df.insert(0, "scenario", scenario)
-            metrics_df.insert(1, "run", run_idx)
-            metrics_df["seed_positions"] = params.seed_positions
-            metrics_df["seed_affil"] = params.seed_affil
-            metrics_df["seed_money"] = params.seed_money
-            metrics_df["seed_dynamics"] = params.seed_dynamics
-
+    try:
+        for completed, result in enumerate(results, start=1):
+            scenario, run_idx, metrics_df, params_dict, representative = result
+            print(f"Completed {completed}/{len(tasks)}: Scenario {scenario}, run {run_idx + 1}", flush=True)
             run_csv = per_run_dir / f"scenario_{scenario}_run_{run_idx:03d}.csv"
             metrics_df.to_csv(run_csv, index=False)
             all_rows.append(metrics_df)
-            params_records.append(params.to_jsonable() | {"run": run_idx})
+            params_records.append(params_dict | {"run": run_idx})
 
-            if run_idx == int(args.representative_run):
+            if representative is not None:
+                C_hist, M_hist, stats_df = representative
+                params = make_params(args, scenario=scenario, run_idx=run_idx)
                 save_npz_run(
                     rep_dir / f"scenario_{scenario}_representative.npz",
                     C_hist,
@@ -206,6 +240,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
                         params=params,
                         out_dir=out_root / "representative_excel" / f"scenario_{scenario}",
                     )
+    finally:
+        if int(args.n_jobs) != 1:
+            executor.shutdown()
 
     all_runs = pd.concat(all_rows, ignore_index=True)
     all_runs.to_csv(out_root / "all_runs_metrics.csv", index=False)
@@ -237,6 +274,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--scenarios", nargs="+", type=int, default=[1, 2, 3, 4], help="Scenarios to run.")
     p.add_argument("--runs", type=int, default=30, help="Number of stochastic runs per scenario.")
     p.add_argument("--representative_run", type=int, default=0, help="Which run to save as representative history.")
+    p.add_argument("--n_jobs", type=int, default=1, help="Parallel worker processes across independent runs.")
 
     # Simulation parameters
     p.add_argument("--N", type=int, default=64)
