@@ -18,6 +18,7 @@ import math
 
 import numpy as np
 import pandas as pd
+from scipy.stats import kurtosis, skew
 
 from simulation_model import SimulationParams, count_agreeing_neighbors, neighbors_moore, occupied_mask
 
@@ -237,6 +238,50 @@ def shape_weighted_entropy(
 # Independent structural metrics
 # ----------------------------------------------------------------------
 
+def bimodality_coefficient(C: np.ndarray) -> float:
+    """Bias-corrected sample bimodality coefficient (Pfister et al., 2013).
+
+    Values above the uniform-distribution benchmark 5/9 are conventionally
+    treated as evidence compatible with bimodality.  The coefficient is a
+    distributional benchmark, not a spatial statistic.
+    """
+    vals = C[occupied_mask(C)].astype(float)
+    n = int(vals.size)
+    if n < 4 or float(np.nanstd(vals)) == 0.0:
+        return np.nan
+    g = float(skew(vals, bias=False))
+    k_excess = float(kurtosis(vals, fisher=True, bias=False))
+    correction = 3.0 * (n - 1.0) ** 2 / ((n - 2.0) * (n - 3.0))
+    denom = k_excess + correction
+    if denom <= 0.0:
+        return np.nan
+    return float((g * g + 1.0) / denom)
+
+
+def esteban_ray_polarization(C: np.ndarray, alpha: float = 1.6) -> float:
+    """Normalized discrete Esteban--Ray polarization index.
+
+    Affiliation positions are rescaled to [0, 1].  The raw identification-
+    alienation sum is divided by its value for two equally sized groups at the
+    endpoints, so that the canonical maximally separated bipolar distribution
+    has value one.
+    """
+    vals = C[occupied_mask(C)].astype(float)
+    if vals.size == 0:
+        return np.nan
+    support, counts = np.unique(vals, return_counts=True)
+    if support.size < 2:
+        return 0.0
+    p = counts.astype(float) / float(counts.sum())
+    span = float(np.max(support) - np.min(support))
+    if span <= 0.0:
+        return 0.0
+    y = (support - np.min(support)) / span
+    distances = np.abs(y[:, None] - y[None, :])
+    raw = float(np.sum((p[:, None] ** (1.0 + alpha)) * p[None, :] * distances))
+    bipolar_reference = 2.0 * (0.5 ** (2.0 + alpha))
+    return float(raw / bipolar_reference)
+
 def polarization_index(C: np.ndarray, max_abs_C: float) -> float:
     vals = C[occupied_mask(C)]
     if vals.size == 0 or max_abs_C <= 0:
@@ -258,33 +303,84 @@ def tail_mass_index(C: np.ndarray, tail_threshold: int) -> float:
     return float(np.mean(np.abs(vals) >= tail_threshold))
 
 
-def segregation_index(C: np.ndarray) -> float:
-    """
-    Fraction of neighboring occupied non-neutral pairs with the same sign.
+def spatial_segregation_metrics(C: np.ndarray) -> Tuple[float, float, float]:
+    """Return same-sign edge share, Moran's I, and sign assortativity.
 
-    Each Moore edge is counted once. Pairs with at least one neutral C=0 agent are
-    excluded from this sign-based segregation index.
+    All three measures use the same occupied Moore edges and are evaluated in a
+    single vectorized pass.  This preserves their definitions while keeping the
+    120-run, 101-step validation computationally practical.
     """
-    N = C.shape[0]
+    occ = occupied_mask(C)
+    vals = C[occ].astype(float)
+    n = int(vals.size)
+    if n < 2:
+        return np.nan, np.nan, np.nan
+    mean = float(vals.mean())
+    denom = float(np.sum((vals - mean) ** 2))
+
+    edge_pairs = [
+        (C[:, :-1], C[:, 1:]),
+        (C[:-1, :], C[1:, :]),
+        (C[:-1, :-1], C[1:, 1:]),
+        (C[:-1, 1:], C[1:, :-1]),
+    ]
+    moran_numerator = 0.0
+    n_edges = 0
     same = 0
-    total = 0
-    directions = [(0, 1), (1, 0), (1, 1), (1, -1)]
-    for i in range(N):
-        for j in range(N):
-            if np.isnan(C[i, j]) or C[i, j] == 0:
-                continue
-            s0 = np.sign(C[i, j])
-            for di, dj in directions:
-                ii, jj = i + di, j + dj
-                if 0 <= ii < N and 0 <= jj < N:
-                    if np.isnan(C[ii, jj]) or C[ii, jj] == 0:
-                        continue
-                    total += 1
-                    if np.sign(C[ii, jj]) == s0:
-                        same += 1
-    if total == 0:
-        return np.nan
-    return float(same / total)
+    sign_edges = 0
+    mixing = np.zeros((2, 2), dtype=float)
+    for left, right in edge_pairs:
+        valid = ~np.isnan(left) & ~np.isnan(right)
+        if np.any(valid):
+            x = left[valid]
+            y = right[valid]
+            moran_numerator += float(np.sum((x - mean) * (y - mean)))
+            n_edges += int(x.size)
+
+        valid_sign = valid & (left != 0) & (right != 0)
+        if np.any(valid_sign):
+            x_sign = left[valid_sign] > 0
+            y_sign = right[valid_sign] > 0
+            same += int(np.sum(x_sign == y_sign))
+            sign_edges += int(x_sign.size)
+            np.add.at(mixing, (x_sign.astype(int), y_sign.astype(int)), 1.0)
+            np.add.at(mixing, (y_sign.astype(int), x_sign.astype(int)), 1.0)
+
+    pair_share = float(same / sign_edges) if sign_edges > 0 else np.nan
+    moran = (
+        float((n / n_edges) * (moran_numerator / denom))
+        if n_edges > 0 and denom > 0.0
+        else np.nan
+    )
+    total = float(mixing.sum())
+    if total <= 0.0:
+        return pair_share, moran, np.nan
+    e = mixing / total
+    a = e.sum(axis=1)
+    b = e.sum(axis=0)
+    expected = float(np.sum(a * b))
+    assort_denom = 1.0 - expected
+    assort = (
+        float((np.trace(e) - expected) / assort_denom)
+        if assort_denom > 1e-12
+        else np.nan
+    )
+    return pair_share, moran, assort
+
+
+def segregation_index(C: np.ndarray) -> float:
+    """Fraction of occupied non-neutral Moore edges with the same sign."""
+    return spatial_segregation_metrics(C)[0]
+
+
+def morans_i(C: np.ndarray) -> float:
+    """Global Moran's I using binary Moore-contiguity weights."""
+    return spatial_segregation_metrics(C)[1]
+
+
+def sign_assortativity(C: np.ndarray) -> float:
+    """Newman's nominal assortativity of affiliation sign on Moore edges."""
+    return spatial_segregation_metrics(C)[2]
 
 
 # ----------------------------------------------------------------------
@@ -302,6 +398,7 @@ def compute_step_metrics(
     tail_threshold: Optional[int] = None,
     center_threshold: Optional[int] = None,
     kappa_center: float = 1.0,
+    include_structural: bool = True,
 ) -> Dict[str, float]:
     C_min, C_max = params.C_range
     max_abs_C = max(abs(C_min), abs(C_max))
@@ -326,22 +423,34 @@ def compute_step_metrics(
         "qB": q_state["B"],
         "qA": q_state["A"],
         "qT": q_state["T"],
-        "polarization": polarization_index(C, max_abs_C=max_abs_C),
-        "central_depletion": central_depletion_index(C, center_threshold=center_threshold),
-        "tail_mass": tail_mass_index(C, tail_threshold=tail_threshold),
-        "segregation": segregation_index(C),
         "tail_threshold": tail_threshold,
         "center_threshold": center_threshold,
         "q_tsallis": q_tsallis,
         "beta_tail": beta_tail,
         "beta_bimodal": beta_bimodal,
     }
+    if include_structural:
+        pair_share, moran_value, assortativity_value = spatial_segregation_metrics(C)
+        row.update({
+            "polarization": polarization_index(C, max_abs_C=max_abs_C),
+            "central_depletion": central_depletion_index(C, center_threshold=center_threshold),
+            "tail_mass": tail_mass_index(C, tail_threshold=tail_threshold),
+            "segregation": pair_share,
+            "bimodality_coefficient": bimodality_coefficient(C),
+            "esteban_ray_polarization": esteban_ray_polarization(C),
+            "morans_I": moran_value,
+            "sign_assortativity": assortativity_value,
+        })
 
     lattice = {
         "S_full_lattice": 0.0,
         "S_shannon_lattice": 0.0,
         "S_tail_ablation_lattice": 0.0,
         "S_bimodal_ablation_lattice": 0.0,
+        "tail_score_lattice": 0.0,
+        "bimodal_score_lattice": 0.0,
+        "weighted_tail_contribution_lattice": 0.0,
+        "weighted_bimodal_contribution_lattice": 0.0,
         "wN_lattice": 0.0,
         "wT_lattice": 0.0,
         "wB_lattice": 0.0,
@@ -374,7 +483,7 @@ def compute_step_metrics(
         S_full = shape_weighted_entropy(comps, weights)
 
         # Simple ablations. These intentionally use the same raw scores, but remove
-        # the adaptive shape weighting so reviewer-facing comparisons are transparent.
+        # the adaptive shape weighting to keep the comparisons transparent.
         S_tail_ablation = comps["H_shannon"] + comps["tail_score"]
         S_bimodal_ablation = comps["H_shannon"] + comps["bimodal_score"]
 
@@ -391,6 +500,10 @@ def compute_step_metrics(
         lattice["S_shannon_lattice"] += qX * comps["H_shannon"]
         lattice["S_tail_ablation_lattice"] += qX * S_tail_ablation
         lattice["S_bimodal_ablation_lattice"] += qX * S_bimodal_ablation
+        lattice["tail_score_lattice"] += qX * comps["tail_score"]
+        lattice["bimodal_score_lattice"] += qX * comps["bimodal_score"]
+        lattice["weighted_tail_contribution_lattice"] += qX * weights[1] * comps["tail_score"]
+        lattice["weighted_bimodal_contribution_lattice"] += qX * weights[2] * comps["bimodal_score"]
         lattice["wN_lattice"] += qX * weights[0]
         lattice["wT_lattice"] += qX * weights[1]
         lattice["wB_lattice"] += qX * weights[2]
@@ -411,6 +524,7 @@ def compute_metrics_for_history(
     tail_threshold: Optional[int] = None,
     center_threshold: Optional[int] = None,
     kappa_center: float = 1.0,
+    include_structural: bool = True,
 ) -> pd.DataFrame:
     rows: List[Dict[str, float]] = []
     for t in range(C_history.shape[0]):
@@ -423,6 +537,7 @@ def compute_metrics_for_history(
             tail_threshold=tail_threshold,
             center_threshold=center_threshold,
             kappa_center=kappa_center,
+            include_structural=include_structural,
         )
         row["step"] = t
         rows.append(row)
