@@ -14,6 +14,8 @@ fig3_entropy_comparison.png
 fig4_shape_weights.png
 fig5_ablation_correlations.png
 fig6_scenario4_freezing.png
+fig7_external_validation.png
+fig8_size_parameter_robustness.png
 """
 
 from __future__ import annotations
@@ -253,6 +255,115 @@ def make_fig6_scenario4_freezing(summary: pd.DataFrame, out_dir: Path) -> None:
     plt.close(fig)
 
 
+def make_fig7_external_validation(summary: pd.DataFrame, out_dir: Path) -> None:
+    """Compare the diagnostic components with external distributional/spatial indices."""
+    scenarios = sorted(summary["scenario"].unique())
+    fig, axes = plt.subplots(2, len(scenarios), figsize=(15.5, 6.8), sharex="col")
+    colors = {
+        "bimodal_score_lattice": "#1f77b4",
+        "bimodality_coefficient": "#d62728",
+        "esteban_ray_polarization": "#2ca02c",
+        "morans_I": "#9467bd",
+        "sign_assortativity": "#ff7f0e",
+        "edge_excess": "#4c4c4c",
+    }
+    for col, scenario in enumerate(scenarios):
+        df = summary[summary["scenario"] == scenario].sort_values("step")
+        ax = axes[0, col]
+        for variable, label in [
+            ("bimodal_score_lattice", "shape component $B$"),
+            ("bimodality_coefficient", "bimodality coefficient"),
+            ("esteban_ray_polarization", "Esteban--Ray"),
+        ]:
+            ax.plot(df["step"], df[f"{variable}_mean"], label=label, color=colors[variable])
+        ax.axhline(5.0 / 9.0, color="#d62728", linestyle=":", linewidth=1.0, alpha=0.7)
+        ax.set_ylim(-0.06, 1.06)
+        ax.set_title(f"Scenario {scenario}")
+        ax.grid(True, alpha=0.22)
+        if col == 0:
+            ax.set_ylabel("Distributional index")
+
+        ax = axes[1, col]
+        ax.plot(df["step"], df["morans_I_mean"], label="Moran's $I$", color=colors["morans_I"])
+        ax.plot(df["step"], df["sign_assortativity_mean"], label="sign assortativity", color=colors["sign_assortativity"])
+        edge_excess = 2.0 * df["segregation_mean"] - 1.0
+        ax.plot(df["step"], edge_excess, label="excess same-sign edges", color=colors["edge_excess"])
+        ax.axhline(0.0, color="black", linewidth=0.8, alpha=0.5)
+        ax.set_ylim(-0.12, 1.02)
+        ax.set_xlabel("Step")
+        ax.grid(True, alpha=0.22)
+        if col == 0:
+            ax.set_ylabel("Spatial index")
+
+    handles_top, labels_top = axes[0, 0].get_legend_handles_labels()
+    handles_bottom, labels_bottom = axes[1, 0].get_legend_handles_labels()
+    fig.legend(handles_top, labels_top, loc="upper center", bbox_to_anchor=(0.5, 1.01), ncol=3, frameon=False)
+    fig.legend(handles_bottom, labels_bottom, loc="lower center", bbox_to_anchor=(0.5, -0.01), ncol=3, frameon=False)
+    fig.tight_layout(rect=[0, 0.05, 1, 0.95])
+    fig.savefig(out_dir / "fig7_external_validation.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _annotated_heatmap(ax, matrix: np.ndarray, rows: List[str], title: str, vmin: float, vmax: float) -> None:
+    im = ax.imshow(matrix, aspect="auto", vmin=vmin, vmax=vmax, cmap="viridis")
+    ax.set_xticks(range(4), labels=["S1", "S2", "S3", "S4"])
+    ax.set_yticks(range(len(rows)), labels=rows)
+    ax.set_title(title)
+    for i in range(matrix.shape[0]):
+        for j in range(matrix.shape[1]):
+            value = matrix[i, j]
+            color = "white" if value < (vmin + vmax) / 2.0 else "black"
+            ax.text(j, i, f"{value:.2f}", ha="center", va="center", fontsize=7.5, color=color)
+    return im
+
+
+def make_fig8_size_parameter_robustness(validation_dir: Path, out_dir: Path) -> None:
+    summary = pd.read_csv(validation_dir / "sweep_summary.csv")
+    final = summary[summary["step"] == summary["step"].max()].copy()
+    fig, axes = plt.subplots(2, 2, figsize=(13.5, 9.0))
+
+    size_order = ["baseline", "size_N96", "size_N128"]
+    size_labels = [64, 96, 128]
+    for scenario in (1, 2, 3, 4):
+        values = []
+        spatial = []
+        for config in size_order:
+            row = final[(final["config"] == config) & (final["scenario"] == scenario)].iloc[0]
+            values.append(row["bimodal_score_lattice_mean"])
+            spatial.append(row["morans_I_mean"])
+        axes[0, 0].plot(size_labels, values, marker="o", label=f"Scenario {scenario}")
+        axes[0, 1].plot(size_labels, spatial, marker="o", label=f"Scenario {scenario}")
+    axes[0, 0].set(title="Final shape component across lattice sizes", xlabel="Lattice side $N$", ylabel="$B(100)$", ylim=(-0.05, 1.05))
+    axes[0, 1].set(title="Final spatial autocorrelation across lattice sizes", xlabel="Lattice side $N$", ylabel="Moran's $I(100)$", ylim=(-0.05, 1.05))
+    for ax in axes[0, :]:
+        ax.set_xticks(size_labels)
+        ax.grid(True, alpha=0.25)
+    axes[0, 1].legend(loc="lower right", ncol=2, fontsize=8)
+
+    config_order = [
+        "happy_h3", "happy_h5", "vacancy_v020", "vacancy_v040",
+        "calls_n1", "calls_n3", "cost_scale075", "cost_scale125",
+    ]
+    row_labels = [
+        "$h=3$", "$h=5$", "$v=0.20$", "$v=0.40$",
+        "$n_{call}=1$", "$n_{call}=3$", "cost $\\times0.75$", "cost $\\times1.25$",
+    ]
+    B = np.full((len(config_order), 4), np.nan)
+    I = np.full((len(config_order), 4), np.nan)
+    for i, config in enumerate(config_order):
+        for j, scenario in enumerate((1, 2, 3, 4)):
+            row = final[(final["config"] == config) & (final["scenario"] == scenario)].iloc[0]
+            B[i, j] = row["bimodal_score_lattice_mean"]
+            I[i, j] = row["morans_I_mean"]
+    im1 = _annotated_heatmap(axes[1, 0], B, row_labels, "Final shape component: model-parameter sweep", 0.0, 1.0)
+    im2 = _annotated_heatmap(axes[1, 1], I, row_labels, "Final Moran's $I$: model-parameter sweep", 0.0, 1.0)
+    fig.colorbar(im1, ax=axes[1, 0], fraction=0.046, pad=0.04)
+    fig.colorbar(im2, ax=axes[1, 1], fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(out_dir / "fig8_size_parameter_robustness.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
 def run(args: argparse.Namespace) -> None:
     results_dir = Path(args.results)
     out_dir = Path(args.out) if args.out else results_dir / "paper_figures"
@@ -271,6 +382,9 @@ def run(args: argparse.Namespace) -> None:
     make_fig4_shape_weights(summary, out_dir)
     make_fig5_ablation_correlations(corr, out_dir)
     make_fig6_scenario4_freezing(summary, out_dir)
+    make_fig7_external_validation(summary, out_dir)
+    if args.validation_results:
+        make_fig8_size_parameter_robustness(Path(args.validation_results), out_dir)
 
     print(f"Figures written to: {out_dir}")
 
@@ -279,6 +393,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Make paper figures from batch results.")
     p.add_argument("--results", default="results_paper", help="Directory generated by run_paper_batch.py")
     p.add_argument("--out", default=None, help="Figure output directory. Defaults to <results>/paper_figures")
+    p.add_argument(
+        "--validation-results",
+        "--validation_results",
+        dest="validation_results",
+        default=None,
+        help="Directory generated by run_robustness_validation.py",
+    )
     return p
 
 
